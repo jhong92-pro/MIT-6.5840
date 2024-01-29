@@ -15,13 +15,13 @@ import "time"
 // and reply for an RPC.
 //
 
-// type ExampleArgs struct {
-// 	X int
-// }
+type ExampleArgs struct {
+	X int
+}
 
-// type ExampleReply struct {
-// 	Y int
-// }
+type ExampleReply struct {
+	Y int
+}
 
 // Add your RPC definitions here.
 type TaskStatus int
@@ -37,7 +37,6 @@ type TaskType int
 const (
 	MAP TaskType = iota
 	REDUCE
-	BREAK
 )
 
 type Task struct {
@@ -46,6 +45,29 @@ type Task struct {
 	InputFiles []string
 	Index int
 	TimeStamp time.Time
+}
+
+type DoJob int
+const (
+	BREAK DoJob = iota
+	WAIT
+	DO
+)
+
+type ReplyTask struct {
+	DoJob DoJob
+	Task Task
+	NReduce int
+}
+
+type CompleteMessageCode int
+const (
+	FAIL CompleteMessageCode = iota
+	SUCCESS
+)
+
+type TaskCompleteReply struct {
+	CompleteMessageCode CompleteMessageCode
 }
 
 // Cook up a unique-ish UNIX-domain socket name

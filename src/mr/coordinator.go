@@ -7,74 +7,83 @@ import "net/rpc"
 import "net/http"
 import "strconv"
 import "sync"
-
+import "time"
 
 type Coordinator struct {
 	// Your definitions here.
 	mu sync.Mutex
 	mapTasks []Task
 	reduceTasks []Task
-	mapDone bool
-	reduceDone bool
+	mapDone int
+	reduceDone int
+	nReduce int
 }
 
 // Your code here -- RPC handlers for the worker to call.
 
-func (c *Coordinator) AssignTask(replyTask *Task) error {
+func (c *Coordinator) RequestTask(args *ExampleArgs, replyTask *ReplyTask) error {
+	// args *ExampleArgs is not used
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	replyTask.TaskType = BREAK
-	if !c.mapDone {
-		replyTask.TaskType = MAP
+	if len(c.mapTasks)!=c.mapDone {
+		replyTask.Task.TaskType = MAP
+	}else if len(c.reduceTasks)!=c.reduceDone{
+		replyTask.Task.TaskType = REDUCE
+	}else{
+		replyTask.DoJob = BREAK
+		return nil
 	}
-	else if !c.reduceDone(){
-		replyTask.TaskType = REDUCE
-	}
-	AssignTask(replyTask)
+	c.assignTask(replyTask)
+	return nil
+}
+func (c *Coordinator) Example(args *ExampleArgs, reply *ExampleReply) error {
+	reply.Y = args.X + 1
 	return nil
 }
 
-// type Task struct {
-// 	TaskStatus TaskStatus
-// 	TaskType TaskType
-// 	InputFiles []string
-// 	Index int
-// 	TimeStamp time.Time
-// }
-
-func (c *Coordinator) AssignTask(replyTask *Task){
-	if replyTask.TaskType==BREAK{
-		return nil
-	}
+func (c *Coordinator) assignTask(replyTask *ReplyTask){
 	var refTasks []Task
-	if replyTask.TaskType==MAP{
+	if replyTask.Task.TaskType==MAP{
 		refTasks = c.mapTasks
-	}
-	else{ // in case of REDUCE
+	}else{ // in case of REDUCE
 		refTasks = c.reduceTasks
 	}
+	replyTask.NReduce = c.nReduce
+	replyTask.DoJob = WAIT
 	for index, task := range refTasks {
 		tenSecondsAgo := time.Now().Add(-10 * time.Second)
-		if task.TaskStatus==NOT_STARTED || task.TaskStatus==(WAITING && task.TimeStamp.Before(tenSecondsAgo)){
+		if task.TaskStatus==NOT_STARTED || (task.TaskStatus==WAITING && task.TimeStamp.Before(tenSecondsAgo)){
 			refTasks[index].TaskStatus = WAITING
 			refTasks[index].TimeStamp = time.Now()
-			replyTask.InputFiles = task.InputFiles
-			replyTask.Index = index
+			replyTask.Task = task
+			replyTask.DoJob = DO
 			break
 		}
 	}
 }
 
-//
-// an example RPC handler.
-//
-// the RPC argument and reply types are defined in rpc.go.
-//
-// func (c *Coordinator) Example(args *ExampleArgs, reply *ExampleReply) error {
-// 	reply.Y = args.X + 1
-// 	return nil
-// }
-
+func (c *Coordinator) TaskComplete(task *Task, taskCompleteReply *TaskCompleteReply) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	var refTask []Task
+	if task.TaskType==MAP{
+		refTask = c.mapTasks
+	}else{ // task.TaskType==REDUCE
+		refTask = c.reduceTasks
+	}
+	if refTask[task.Index].TaskStatus==DONE{
+		taskCompleteReply.CompleteMessageCode = FAIL
+		return nil
+	}
+	refTask[task.Index].TaskStatus=DONE
+	if task.TaskType==MAP{
+		c.mapDone += 1
+	}else{ // task.TaskType==REDUCE
+		c.reduceDone += 1
+	}
+	taskCompleteReply.CompleteMessageCode = SUCCESS
+	return nil
+}
 
 //
 // start a thread that listens for RPCs from worker.go
@@ -97,12 +106,10 @@ func (c *Coordinator) server() {
 // if the entire job has finished.
 //
 func (c *Coordinator) Done() bool {
-	ret := false
-
 	// Your code here.
-
-
-	return ret
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return 	len(c.mapTasks)==c.mapDone && len(c.reduceTasks)==c.reduceDone
 }
 
 //
@@ -111,11 +118,10 @@ func (c *Coordinator) Done() bool {
 // nReduce is the number of reduce tasks to use.
 //
 func MakeCoordinator(files []string, nReduce int) *Coordinator {
+	
 	c := Coordinator{}
 
 	// Your code here.
-	c.mapDone = false
-	c.reduceDone = false
 
 	var mapTasks []Task
 	for i:=0; i<len(files); i++{
@@ -141,9 +147,9 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 	}
 	c.reduceTasks = reduceTasks
 
-	c.mapDone = false
-	c.reduceDone = false
-
+	c.mapDone = 0
+	c.reduceDone = 0
+	c.nReduce = nReduce
 	c.server()
 	return &c
 }
@@ -151,7 +157,7 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 func getIntermediateFiles(j int, lenFiles int) []string{
 	var files []string
 	for i:=0; i<lenFiles; i++{
-		files = append(files, "mr-intermediate-"+strconv.Itoa(i)+"-"+strconv.Itoa(j))
+		files = append(files, "mr-"+strconv.Itoa(i)+"-"+strconv.Itoa(j))
 	}
 	return files
 }
