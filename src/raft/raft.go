@@ -176,24 +176,25 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	defer rf.mu.Unlock()
 
 	rf.lastReceive = time.Now()
-
 	if args.Term < rf.currentTerm {
 		reply.Success = false
 		reply.Term = rf.currentTerm
 		return
 	}
 
-	if args.Term > rf.currentTerm {
+	if args.Term >= rf.currentTerm {
+		if rf.state == Leader {
+			DPrintf("%d back to follower by AppendEntries", rf.me)
+		}
 		convertToFollower(rf, args.Term)
 	}
 
-	if args.Term >= rf.currentTerm {
-		rf.currentTerm = args.Term
-		rf.votedFor = args.LeaderId
-		rf.lastReceive = time.Now()
-	}
+	// if args.Term >= rf.currentTerm {
+	// 	rf.currentTerm = args.Term
+	// }
 
 	if args.Type == Heartbeat {
+		DPrintf("%d got heartbeat from %d", rf.me, args.LeaderId)
 		reply.Success = true
 		reply.Term = rf.currentTerm
 		return
@@ -230,14 +231,21 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	defer rf.mu.Unlock()
 	lastTerm, lastIndex := getLastEntryInfo(rf)
 	isLogUpToDate := args.LastLogTerm > lastTerm || (args.LastLogTerm == lastTerm && args.LastLogIndex >= lastIndex)
-	isVoted := args.Term > rf.currentTerm || args.Term == rf.currentTerm && (rf.votedFor == args.CandidateId)
+	// isVoted := args.Term > rf.currentTerm || args.Term == rf.currentTerm && (rf.votedFor == args.CandidateId)
+	// isVoted := args.Term >= rf.currentTerm && (rf.votedFor ==-1 || rf.votedFor == args.CandidateId)
+
 	rf.lastReceive = time.Now()
 	if args.Term > rf.currentTerm {
+		if rf.state == Leader {
+			DPrintf("%d back to follower : args.Term : %d, args.CandidateId : %d, rf.currentTerm : %d", rf.me, args.Term, args.CandidateId, rf.currentTerm)
+		}
 		convertToFollower(rf, args.Term)
 	}
+
+	isVoted := args.Term >= rf.currentTerm && (rf.votedFor == -1 || rf.votedFor == args.CandidateId)
+
 	if isVoted && isLogUpToDate {
 		reply.VotedGranted = true
-		rf.currentTerm = args.Term
 		rf.votedFor = args.CandidateId
 	} else {
 		reply.VotedGranted = false
@@ -331,10 +339,12 @@ func (rf *Raft) ticker() {
 
 		// Your code here (2A)
 		// Check if a leader election should be started.
-		electionTimeout := 150 + rand.Intn(150)
+		electionTimeout := 150 + (rand.Int63() % 150)
 		rf.mu.Lock()
-		if rf.lastReceive.Add(time.Duration(electionTimeout)).Before(time.Now()) && rf.state != Leader {
+		tnow := time.Now()
+		if rf.lastReceive.Add(time.Duration(electionTimeout)*time.Millisecond).Before(tnow) && rf.state != Leader {
 			DPrintf("%d kicks off election", rf.me)
+			DPrintf("%s, %s", tnow, rf.lastReceive)
 			go rf.KickoffElection()
 		}
 		rf.mu.Unlock()
@@ -396,7 +406,7 @@ func (rf *Raft) KickoffElection() {
 	defer rf.mu.Unlock()
 	for numVote <= len(rf.peers)/2 && finishedCnt < len(rf.peers) {
 		cond.Wait()
-		if rf.state != Leader {
+		if rf.state == Follower {
 			break
 		}
 	}
@@ -411,14 +421,12 @@ func (rf *Raft) KickoffElection() {
 
 func (rf *Raft) sendHeartbeat() {
 	for rf.state == Leader {
-		numAuthority := 1
-		finishedCnt := 1
 		args := AppendEntriesArgs{
 			Type:     Heartbeat,
 			Term:     rf.currentTerm,
 			LeaderId: rf.me,
 		}
-		cond := sync.NewCond(&rf.mu)
+		DPrintf("%d sending heartbeat", rf.me)
 		for i := 0; i < len(rf.peers); i++ {
 			if i == rf.me {
 				continue
@@ -428,28 +436,16 @@ func (rf *Raft) sendHeartbeat() {
 				ok := rf.sendAppendEntries(p, &args, &reply)
 				rf.mu.Lock()
 				defer rf.mu.Unlock()
-				defer cond.Broadcast()
-				finishedCnt++
 				if !ok {
 					return
 				}
-				if reply.Success {
-					numAuthority++
-				}
 				if reply.Term > rf.currentTerm {
+					DPrintf("%d found bigger Term", rf.me)
 					convertToFollower(rf, reply.Term)
 				}
 			}(i)
 		}
-		rf.mu.Lock()
-		for numAuthority <= len(rf.peers)/2 && finishedCnt < len(rf.peers) {
-			cond.Wait()
-		}
-		if numAuthority <= len(rf.peers)/2 && rf.state == Leader {
-			convertToFollower(rf, rf.currentTerm)
-		}
-		rf.mu.Unlock()
-		ms := 10
+		ms := 25
 		time.Sleep(time.Duration(ms) * time.Millisecond)
 	}
 }
