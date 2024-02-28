@@ -50,7 +50,7 @@ type ApplyMsg struct {
 }
 
 type LogEntry struct {
-	term    int
+	Term    int
 	Command interface{}
 }
 
@@ -73,6 +73,7 @@ type Raft struct {
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
+	applyCh chan ApplyMsg
 
 	state       ServerState
 	lastReceive time.Time
@@ -81,11 +82,11 @@ type Raft struct {
 	votedFor    int
 	log         []LogEntry
 
-	// commitIndex int
-	// lastApplied int
+	commitIndex int
+	lastApplied int
 
-	// nextIndex []int
-	// matchIndex []int
+	nextIndex  []int
+	matchIndex []int
 }
 
 // return currentTerm and whether this server
@@ -152,18 +153,19 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 type AppendType int
 
 type AppendEntriesArgs struct {
-	Type     AppendType
-	Term     int
-	LeaderId int
-	// prevLogIndex int
-	// prevLogTerm  int
-	// entries []LogEntry
-	// leaderCommit int
+	Type         AppendType
+	Term         int
+	LeaderId     int
+	PrevLogIndex int
+	PrevLogTerm  int
+	Entries      []LogEntry
+	LeaderCommit int
 }
 
 const (
 	Heartbeat AppendType = iota
 	Replicate
+	Commit
 )
 
 type AppendEntriesReply struct {
@@ -194,11 +196,70 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// }
 
 	if args.Type == Heartbeat {
-		DPrintf("%d got heartbeat from %d", rf.me, args.LeaderId)
+		// DPrintf("%d got heartbeat from %d", rf.me, args.LeaderId)
 		reply.Success = true
 		reply.Term = rf.currentTerm
 		return
 	}
+
+	if args.Type == Replicate {
+		term, index := getLastEntryInfo(rf)
+		if term == -1 && index == -1 && args.PrevLogIndex == -1 && args.PrevLogTerm == -1 {
+			// initial log
+			reply.Success = true
+			rf.log = append(rf.log, args.Entries...)
+			return
+		}
+		if args.PrevLogIndex > index {
+			reply.Success = false
+			return
+		}
+		if args.PrevLogIndex == index && args.PrevLogTerm != term {
+			rf.log = rf.log[:len(rf.log)-1]
+			reply.Success = false
+			return
+		}
+		// there can't be a scenario that args.PrevLogIndex < index
+		reply.Success = true
+		rf.log = append(rf.log, args.Entries...)
+		return
+	}
+
+	if args.Type == Commit {
+		if rf.commitIndex >= args.LeaderCommit {
+			reply.Success = false
+			return
+		}
+		rf.commitIndex = args.LeaderCommit
+		go rf.applyLocalMachine(rf.commitIndex)
+		return
+	}
+}
+
+func (rf *Raft) applyLocalMachine(currCommitIndex int) {
+	rf.mu.Lock()
+	if currCommitIndex < rf.commitIndex {
+		rf.mu.Unlock()
+		return
+	}
+	applyMsg := ApplyMsg{
+		CommandValid: true,
+		Command:      rf.log[rf.lastApplied+1].Command,
+		CommandIndex: rf.lastApplied + 1,
+	}
+	rf.lastApplied++
+	rf.mu.Unlock()
+	rf.applyCh <- applyMsg
+
+	rf.mu.Lock()
+	if currCommitIndex < rf.commitIndex {
+		rf.mu.Unlock()
+		return
+	}
+	if rf.lastApplied < rf.commitIndex {
+		go rf.applyLocalMachine(currCommitIndex)
+	}
+	rf.mu.Unlock()
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
@@ -256,7 +317,7 @@ func getLastEntryInfo(rf *Raft) (int, int) {
 	lastIndex := len(rf.log) - 1
 	term := -1
 	if lastIndex >= 0 {
-		term = rf.log[lastIndex].term
+		term = rf.log[lastIndex].Term
 	}
 	return term, lastIndex
 }
@@ -311,8 +372,122 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	isLeader := true
 
 	// Your code here (2B).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	isLeader = rf.state == Leader
+	if !isLeader {
+		return -1, -1, isLeader
+	}
 
-	return index, term, isLeader
+	logEntry := LogEntry{Term: term, Command: command}
+	rf.log = append(rf.log, logEntry)
+	_, index = getLastEntryInfo(rf)
+
+	for i := 0; i < len(rf.peers); i++ {
+		if rf.me == i {
+			continue
+		}
+		go rf.appendEntriesToFollower(i, term, index)
+	}
+	return index, term, true
+}
+
+func (rf *Raft) appendEntriesToFollower(followerId int, requestTerm int, requestIndex int) {
+	ms := 25
+	for {
+		rf.mu.Lock()
+		_, lastLogIndex := getLastEntryInfo(rf)
+		if rf.state != Leader || rf.currentTerm != requestTerm || lastLogIndex != requestIndex {
+			rf.mu.Unlock()
+			break
+		}
+
+		startIndex := rf.nextIndex[followerId]
+		entries := rf.log[startIndex:]
+		prevLogIndex := startIndex - 1
+		prevLogTerm := -1
+		if prevLogIndex >= 0 {
+			prevLogTerm = rf.log[prevLogIndex].Term
+		}
+
+		args := AppendEntriesArgs{
+			Type:         Replicate,
+			Term:         rf.currentTerm,
+			LeaderId:     rf.me,
+			PrevLogIndex: prevLogIndex,
+			PrevLogTerm:  prevLogTerm,
+			Entries:      entries,
+		}
+		reply := AppendEntriesReply{}
+		ok := rf.sendAppendEntries(followerId, &args, &reply)
+		if !ok {
+			rf.mu.Unlock()
+			time.Sleep(time.Duration(ms) * time.Millisecond)
+			continue
+		}
+		if reply.Success {
+			rf.nextIndex[followerId] = len(rf.log)
+			rf.matchIndex[followerId] = len(rf.log) - 1
+			go rf.triggerCommit(followerId, rf.matchIndex[followerId])
+			rf.mu.Unlock()
+			break
+		} else {
+			if rf.nextIndex[followerId] > 0 {
+				rf.nextIndex[followerId]--
+			}
+		}
+		rf.mu.Unlock()
+		time.Sleep(time.Duration(ms) * time.Millisecond)
+	}
+}
+
+func (rf *Raft) triggerCommit(followerId int, index int) {
+	rf.mu.Lock()
+	if rf.commitIndex >= index {
+		rf.mu.Unlock()
+		return
+	}
+	numCommit := 0
+	for i := 0; i < len(rf.peers); i++ {
+		if rf.matchIndex[i] >= index {
+			numCommit++
+		}
+	}
+	if numCommit <= len(rf.peers)/2 {
+		rf.mu.Unlock()
+		return
+	}
+	rf.commitIndex = index
+	rf.applyLocalMachine(rf.commitIndex)
+	for i := 0; i < len(rf.peers); i++ {
+		go rf.commitToFollower(followerId, index)
+	}
+	rf.mu.Unlock()
+}
+
+func (rf *Raft) commitToFollower(followerId int, index int) {
+	ms := 25
+	for {
+		rf.mu.Lock()
+		if rf.commitIndex != index {
+			rf.mu.Unlock()
+			break
+		}
+		args := AppendEntriesArgs{
+			Type:         Commit,
+			Term:         rf.currentTerm,
+			LeaderId:     rf.me,
+			LeaderCommit: index,
+		}
+		reply := AppendEntriesReply{}
+		ok := rf.sendAppendEntries(followerId, &args, &reply)
+		if ok {
+			rf.mu.Unlock()
+			break
+		}
+		rf.mu.Unlock()
+		time.Sleep(time.Duration(ms) * time.Millisecond)
+	}
 }
 
 // the tester doesn't halt goroutines created by Raft after each test,
@@ -471,6 +646,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.currentTerm = 0
 	rf.votedFor = -1
 	rf.lastReceive = time.Now()
+	rf.applyCh = applyCh
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
