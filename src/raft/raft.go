@@ -19,6 +19,7 @@ package raft
 
 import (
 	//	"bytes"
+
 	"math/rand"
 	"sync"
 	"sync/atomic"
@@ -205,7 +206,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if args.Type == Replicate {
 		term, index := getLastEntryInfo(rf)
 		if term == -1 && index == -1 && args.PrevLogIndex == -1 && args.PrevLogTerm == -1 {
-			// initial log
+			// initial log (I set dummy log when starting the raft, so this if code is not needed)
 			reply.Success = true
 			rf.log = append(rf.log, args.Entries...)
 			return
@@ -231,6 +232,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			return
 		}
 		rf.commitIndex = args.LeaderCommit
+		DPrintf("%d rf.commitIndex: %d", rf.me, rf.commitIndex)
 		go rf.applyLocalMachine(rf.commitIndex)
 		return
 	}
@@ -238,6 +240,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 func (rf *Raft) applyLocalMachine(currCommitIndex int) {
 	rf.mu.Lock()
+	DPrintf("%d, %d", currCommitIndex, rf.commitIndex)
 	if currCommitIndex < rf.commitIndex {
 		rf.mu.Unlock()
 		return
@@ -250,7 +253,6 @@ func (rf *Raft) applyLocalMachine(currCommitIndex int) {
 	rf.lastApplied++
 	rf.mu.Unlock()
 	rf.applyCh <- applyMsg
-
 	rf.mu.Lock()
 	if currCommitIndex < rf.commitIndex {
 		rf.mu.Unlock()
@@ -378,8 +380,8 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	if !isLeader {
 		return -1, -1, isLeader
 	}
-
-	logEntry := LogEntry{Term: term, Command: command}
+	DPrintf("%d starts new command", rf.me)
+	logEntry := LogEntry{Term: rf.currentTerm, Command: command}
 	rf.log = append(rf.log, logEntry)
 	_, index = getLastEntryInfo(rf)
 
@@ -387,7 +389,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		if rf.me == i {
 			continue
 		}
-		go rf.appendEntriesToFollower(i, term, index)
+		go rf.appendEntriesToFollower(i, rf.currentTerm, index)
 	}
 	return index, term, true
 }
@@ -397,11 +399,17 @@ func (rf *Raft) appendEntriesToFollower(followerId int, requestTerm int, request
 	for {
 		rf.mu.Lock()
 		_, lastLogIndex := getLastEntryInfo(rf)
+		// fmt.Println("-----------------")
+		// fmt.Println(rf.state)
+		// fmt.Println(rf.currentTerm)
+		// fmt.Println(requestTerm)
+		// fmt.Println(lastLogIndex)
+		// fmt.Println(requestIndex)
 		if rf.state != Leader || rf.currentTerm != requestTerm || lastLogIndex != requestIndex {
 			rf.mu.Unlock()
 			break
 		}
-
+		DPrintf("appendEntriesToFOllowers followerId: %d, requestTerm: %d, requestIndex: %d", followerId, requestTerm, requestIndex)
 		startIndex := rf.nextIndex[followerId]
 		entries := rf.log[startIndex:]
 		prevLogIndex := startIndex - 1
@@ -443,24 +451,33 @@ func (rf *Raft) appendEntriesToFollower(followerId int, requestTerm int, request
 
 func (rf *Raft) triggerCommit(followerId int, index int) {
 	rf.mu.Lock()
+	DPrintf("%d trigger commit at term : %d, index : %d", rf.me, rf.currentTerm, index)
+
 	if rf.commitIndex >= index {
 		rf.mu.Unlock()
 		return
 	}
-	numCommit := 0
+	numCommit := 1
 	for i := 0; i < len(rf.peers); i++ {
+		if rf.me == i {
+			continue
+		}
 		if rf.matchIndex[i] >= index {
 			numCommit++
 		}
 	}
+	DPrintf("%d numCommit: %d", rf.me, numCommit)
 	if numCommit <= len(rf.peers)/2 {
 		rf.mu.Unlock()
 		return
 	}
 	rf.commitIndex = index
-	rf.applyLocalMachine(rf.commitIndex)
+	go rf.applyLocalMachine(rf.commitIndex)
 	for i := 0; i < len(rf.peers); i++ {
-		go rf.commitToFollower(followerId, index)
+		if rf.me == i {
+			continue
+		}
+		go rf.commitToFollower(i, index)
 	}
 	rf.mu.Unlock()
 }
@@ -469,6 +486,7 @@ func (rf *Raft) commitToFollower(followerId int, index int) {
 	ms := 25
 	for {
 		rf.mu.Lock()
+		DPrintf("commitToFollower rf.commitIndex: %d, index: %d, followerId: %d", rf.commitIndex, index, followerId)
 		if rf.commitIndex != index {
 			rf.mu.Unlock()
 			break
@@ -480,11 +498,13 @@ func (rf *Raft) commitToFollower(followerId int, index int) {
 			LeaderCommit: index,
 		}
 		reply := AppendEntriesReply{}
+		DPrintf("%d : send commit to followerId : %d", rf.me, followerId)
 		ok := rf.sendAppendEntries(followerId, &args, &reply)
 		if ok {
 			rf.mu.Unlock()
 			break
 		}
+		DPrintf("commitToFollower failed rf.commitIndex: %d, index: %d, followerId: %d", rf.commitIndex, index, followerId)
 		rf.mu.Unlock()
 		time.Sleep(time.Duration(ms) * time.Millisecond)
 	}
@@ -596,21 +616,22 @@ func (rf *Raft) KickoffElection() {
 
 func (rf *Raft) sendHeartbeat() {
 	for rf.state == Leader {
+		rf.mu.Lock()
 		args := AppendEntriesArgs{
 			Type:     Heartbeat,
 			Term:     rf.currentTerm,
 			LeaderId: rf.me,
 		}
-		DPrintf("%d sending heartbeat", rf.me)
+		// DPrintf("%d sending heartbeat", rf.me)
 		for i := 0; i < len(rf.peers); i++ {
 			if i == rf.me {
 				continue
 			}
 			go func(p int) {
-				reply := AppendEntriesReply{}
-				ok := rf.sendAppendEntries(p, &args, &reply)
 				rf.mu.Lock()
 				defer rf.mu.Unlock()
+				reply := AppendEntriesReply{}
+				ok := rf.sendAppendEntries(p, &args, &reply)
 				if !ok {
 					return
 				}
@@ -620,6 +641,7 @@ func (rf *Raft) sendHeartbeat() {
 				}
 			}(i)
 		}
+		rf.mu.Unlock()
 		ms := 25
 		time.Sleep(time.Duration(ms) * time.Millisecond)
 	}
@@ -647,6 +669,23 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.votedFor = -1
 	rf.lastReceive = time.Now()
 	rf.applyCh = applyCh
+
+	rf.log = append(rf.log, LogEntry{Term: 0, Command: nil})
+
+	rf.commitIndex = 0
+	rf.lastApplied = 0
+
+	nextIndex := make([]int, len(peers))
+	matchIndex := make([]int, len(peers))
+	for i := range matchIndex {
+		nextIndex[i] = 1
+	}
+	for i := range matchIndex {
+		matchIndex[i] = 0
+	}
+
+	rf.nextIndex = nextIndex
+	rf.matchIndex = matchIndex
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
