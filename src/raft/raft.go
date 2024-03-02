@@ -562,6 +562,7 @@ func (rf *Raft) KickoffElection() {
 	rf.state = Candidate
 	rf.votedFor = rf.me
 	rf.currentTerm++
+	termForLogging := rf.currentTerm
 	rf.lastReceive = time.Now()
 	term, lastIndex := getLastEntryInfo(rf)
 	args := RequestVoteArgs{
@@ -592,46 +593,63 @@ func (rf *Raft) KickoffElection() {
 				convertToFollower(rf, reply.Term)
 				return
 			}
-			if reply.VotedGranted {
+			if reply.VotedGranted && rf.state == Candidate {
 				numVote++
 			}
 		}(i)
 	}
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	for numVote <= len(rf.peers)/2 && finishedCnt < len(rf.peers) {
+	for numVote <= len(rf.peers)/2 && finishedCnt < len(rf.peers) && rf.state == Candidate {
 		cond.Wait()
-		if rf.state == Follower {
-			break
-		}
+		// if rf.state == Follower {
+		// 	break
+		// }
 	}
-	DPrintf("%d request result at term : %d - numVote : %d", rf.me, rf.currentTerm, numVote)
-	if numVote > len(rf.peers)/2 && rf.state == Candidate {
+	DPrintf("%d request result at term : %d - numVote : %d", rf.me, termForLogging, numVote)
+	if numVote > len(rf.peers)/2 && rf.state == Candidate && termForLogging == rf.currentTerm {
 		DPrintf("%d is a new leader at term : %d", rf.me, rf.currentTerm)
 		rf.state = Leader
 		rf.lastReceive = time.Now()
-		go rf.sendHeartbeat()
+		rf.initMatchNextIndex()
+		go rf.sendHeartbeat(rf.currentTerm, rf.me)
 	}
 }
 
-func (rf *Raft) sendHeartbeat() {
-	for rf.state == Leader {
+func (rf *Raft) initMatchNextIndex() {
+	for i := range rf.nextIndex {
+		rf.nextIndex[i] = len(rf.log)
+	}
+	for i := range rf.matchIndex {
+		rf.matchIndex[i] = 0
+	}
+}
+
+func (rf *Raft) sendHeartbeat(currentTerm int, leaderId int) {
+	args := AppendEntriesArgs{
+		Type:     Heartbeat,
+		Term:     currentTerm,
+		LeaderId: leaderId,
+	}
+	for {
+		// rf.mu.Lock()
 		rf.mu.Lock()
-		args := AppendEntriesArgs{
-			Type:     Heartbeat,
-			Term:     rf.currentTerm,
-			LeaderId: rf.me,
+		if rf.currentTerm != currentTerm || rf.state != Leader {
+			rf.mu.Unlock()
+			break
 		}
+		rf.mu.Unlock()
+
 		// DPrintf("%d sending heartbeat", rf.me)
 		for i := 0; i < len(rf.peers); i++ {
 			if i == rf.me {
 				continue
 			}
 			go func(p int) {
-				rf.mu.Lock()
-				defer rf.mu.Unlock()
 				reply := AppendEntriesReply{}
 				ok := rf.sendAppendEntries(p, &args, &reply)
+				rf.mu.Lock()
+				defer rf.mu.Unlock()
 				if !ok {
 					return
 				}
@@ -641,7 +659,7 @@ func (rf *Raft) sendHeartbeat() {
 				}
 			}(i)
 		}
-		rf.mu.Unlock()
+		// rf.mu.Unlock()
 		ms := 25
 		time.Sleep(time.Duration(ms) * time.Millisecond)
 	}
